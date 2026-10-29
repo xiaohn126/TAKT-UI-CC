@@ -44,14 +44,30 @@ async function boot() {
   fs.writeFileSync(path.join(cfg.TAKT_HOME, 'run/desktop.json'), JSON.stringify({ pid: process.pid, version: app.getVersion() }));
   const env = { ...process.env, TAKT_PORT: String(port), TAKT_MCP_PORT: String(mcpPort), TAKT_MANAGED_SERVICES: '1' };
   for (const [name, script, args] of [['mcp-server', 'mcp-server/server.js', ['--http']], ['workbench', 'server/server.js', []]]) {
+    const logPath = path.join(cfg.LOG_DIR, `${name}.log`);
+    const logStart = fs.existsSync(logPath) ? fs.statSync(logPath).size : 0;
     const log = fs.openSync(path.join(cfg.LOG_DIR, `${name}.log`), 'a');
-    const child = spawn(nodePath(), [path.join(backend, script), ...args], { windowsHide: true, env, stdio: ['ignore', log, log] });
+    const child = spawn(nodePath(), [path.join(backend, script), ...args], { windowsHide: true, env, stdio: ['ignore', log, log, 'ipc'] });
+    if (name === 'workbench') child.on('message', async (message) => {
+      if (message?.type !== 'pick-project-directory' || typeof message.id !== 'string') return;
+      try {
+        if (!mainWindow || mainWindow.isDestroyed()) throw Error('桌面窗口尚未就绪');
+        if (mainWindow.isMinimized()) mainWindow.restore();
+        mainWindow.show(); mainWindow.setAlwaysOnTop(true); mainWindow.focus();
+        const result = await dialog.showOpenDialog(mainWindow, { title: '选择要同步的本地项目目录', properties: ['openDirectory'], defaultPath: cfg.DEFAULT_WORK_DIR });
+        if (child.connected) child.send({ type: 'project-directory-result', id: message.id, path: result.canceled ? '' : result.filePaths[0] || '' });
+      } catch (error) {
+        if (child.connected) child.send({ type: 'project-directory-result', id: message.id, error: error.message });
+      } finally {
+        if (mainWindow && !mainWindow.isDestroyed()) mainWindow.setAlwaysOnTop(false);
+      }
+    });
     fs.closeSync(log); children.push(child);
     child.on('error', (err) => fail('TAKT 服务启动失败', `${name}: ${err.message}`));
     child.on('exit', (code) => {
       if (quitting || failed) return;
       let detail = '';
-      try { detail = fs.readFileSync(path.join(cfg.LOG_DIR, `${name}.log`), 'utf8').slice(-3000); } catch {}
+      try { detail = fs.readFileSync(logPath).subarray(logStart).toString('utf8').slice(-3000); } catch {}
       fail('TAKT 服务已退出', `${name} 退出 (${code})\n${detail || '未获得服务日志'}\n完整日志：${cfg.LOG_DIR}`);
     });
   }

@@ -108,6 +108,9 @@ function resolveWorkPath(inputPath = '') {
   if (!inputPath) return primaryLocalDir;
 
   let p = String(inputPath).trim();
+  for (const project of node.projectMappings || []) {
+    if (p === project.remotePath || p.startsWith(project.remotePath + '/')) return path.resolve(project.localPath, p.slice(project.remotePath.length).replace(/^\/+/, ''));
+  }
   let rel = null;
 
   if (p === cfg.TAKT_HOME || p.startsWith(cfg.TAKT_HOME + path.sep)) {
@@ -157,6 +160,9 @@ function rewriteScriptPaths(code = '') {
   const primaryLocalDir = ((node && node.localWorkDir) || MAC_WORK_DIR).split(path.sep).join('/');
   const primaryRemoteDir = ((node && node.remoteWorkDir) || LINUX_WORK_DIR).replace(/\/+$/, '');
   let out = String(code);
+  for (const project of [...(node.projectMappings || [])].sort((a, b) => b.remotePath.length - a.remotePath.length)) {
+    out = out.replaceAll(project.remotePath, project.localPath.split(path.sep).join('/'));
+  }
   if (primaryRemoteDir && primaryRemoteDir !== '/root/work') {
     out = out.replaceAll(primaryRemoteDir, primaryLocalDir);
   }
@@ -1815,8 +1821,15 @@ function getSyncthingApiKey() {
 }
 
 async function syncthingGet(apiKey, apiPath) {
-  const r = await runCommand('curl', ['-s', '--max-time', '1.5', '-H', `X-API-Key: ${apiKey}`, `${SYNCTHING_URL}${apiPath}`]);
-  return r.stdout;
+  try {
+    const res = await fetch(`${SYNCTHING_URL}${apiPath}`, {
+      headers: { 'X-API-Key': apiKey },
+      signal: AbortSignal.timeout(3000),
+    });
+    return res.ok ? await res.text() : '';
+  } catch {
+    return '';
+  }
 }
 
 /** Aggregates Syncthing state over every node's folder / device (local Syncthing REST API). */
@@ -1852,7 +1865,7 @@ async function checkSyncthingStatus(nodes = loadConfiguredNodes().filter((n) => 
 
     let inSyncFiles = 0, globalFiles = 0, needFiles = 0, needBytes = 0;
     let state = 'idle';
-    const folderIds = [...new Set(nodes.map((n) => n.syncthingFolderId).filter(Boolean))];
+    const folderIds = [...new Set(nodes.flatMap((n) => n.projectMappings?.length ? n.projectMappings.map(m => m.id) : [n.syncthingFolderId]).filter(Boolean))];
     for (const fid of folderIds) {
       try {
         const db = JSON.parse((await syncthingGet(apiKey, `/rest/db/status?folder=${encodeURIComponent(fid)}`)) || '{}');
@@ -2012,14 +2025,21 @@ function nodeTunnelSock(node) {
 
 async function probeNode(node, timeoutMs = 5500) {
   const sock = nodeTunnelSock(node);
-  const t0 = Date.now();
-  const res = await runCommand('ssh', [...(platform.isWindows ? ['-o', 'BatchMode=yes', '-o', 'ClearAllForwardings=yes'] : ['-S', sock]), '-o', 'ConnectTimeout=4', node.sshHost, REMOTE_PROBE_CMD], { timeoutMs });
-  const rtt = Date.now() - t0;
+  const options = [...(platform.isWindows ? ['-o', 'BatchMode=yes', '-o', 'ClearAllForwardings=yes'] : ['-S', sock]), '-o', 'ConnectTimeout=4', node.sshHost];
+  const measureConnection = async () => {
+    const started = performance.now();
+    const result = await runCommand('ssh', [...options, 'true'], { timeoutMs });
+    return result.exitCode === 0 ? Math.round(performance.now() - started) : null;
+  };
+  const [res, pingMs] = await Promise.all([
+    runCommand('ssh', [...options, REMOTE_PROBE_CMD], { timeoutMs }),
+    measureConnection(),
+  ]);
   let data = null;
   if (res.exitCode === 0 && res.stdout) {
     try { data = JSON.parse(res.stdout.trim().split('\n').pop()); } catch {}
   }
-  return { data, pingMs: data ? Math.min(999, Math.round(rtt / 2)) : null };
+  return { data, pingMs: data ? pingMs : null };
 }
 
 /** Rebuilds the dedicated MCP reverse-tunnel ControlMaster for one node. Never touches interactive terminals. */
@@ -2100,7 +2120,8 @@ async function runSystemWatchdogCycle(forceHeal = false) {
     const firstData = first ? probeData[first.id] : null;
     const anyMcpOk = onlineIds.some((id) => nodesStatus[id].mcpOk);
     const anyEdaOk = onlineIds.some((id) => nodesStatus[id].edaOk);
-    const bestPing = onlineIds.length ? Math.min(...onlineIds.map((id) => nodesStatus[id].pingMs || 999)) : null;
+    const measuredTimes = onlineIds.map((id) => nodesStatus[id].pingMs).filter((ms) => Number.isFinite(ms) && ms >= 0);
+    const bestPing = measuredTimes.length ? Math.min(...measuredTimes) : null;
 
     systemStatusState.remoteCli = firstData
       ? {

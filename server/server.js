@@ -22,11 +22,12 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { DatabaseSync } = require('node:sqlite');
-const pty = require('node-pty');
+const { spawnTerminal } = require('../lib/pty-session');
 const { WebSocketServer } = require('ws');
 const cfg = require('../config');
 const platform = require('../lib/platform');
 const { mapper } = require('../lib/workspace-paths');
+const { configureProject, removeProject } = require('../lib/project-sync');
 const { sessionName } = require('../lib/ssh');
 
 const PORT = cfg.PORT;
@@ -46,6 +47,22 @@ const WORKBENCH_LOG = path.join(cfg.LOG_DIR, 'workbench-web.log');
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const VENDOR_DIR = path.join(PUBLIC_DIR, 'vendor');
 const SSH_SOCKET_DIR = cfg.SSH_SOCKET_DIR;
+let projectSyncBusy = false;
+let directoryPickerBusy = false;
+function pickDesktopDirectory() {
+  return new Promise((resolve, reject) => {
+    if (!process.send || !process.connected) { reject(Error('请在 TAKT 桌面版中选择目录，或直接填写完整路径')); return; }
+    const id = crypto.randomUUID();
+    const cleanup = () => { clearTimeout(timer); process.off('message', onMessage); };
+    const onMessage = message => {
+      if (message?.type !== 'project-directory-result' || message.id !== id) return;
+      cleanup(); message.error ? reject(Error(message.error)) : resolve(message.path || '');
+    };
+    const timer = setTimeout(() => { cleanup(); reject(Error('目录选择超时，请取消窗口后重试')); }, 300000);
+    process.on('message', onMessage);
+    process.send({ type: 'pick-project-directory', id }, error => { if (error) { cleanup(); reject(error); } });
+  });
+}
 
 fs.mkdirSync(LOCAL_WORK_DIR, { recursive: true });
 fs.mkdirSync(path.dirname(WORKBENCH_LOG), { recursive: true });
@@ -79,7 +96,9 @@ function runCmd(cmd, args, timeoutMs = 8000) {
     });
     let stdout = '';
     let stderr = '';
+    let timedOut = false;
     const timer = setTimeout(() => {
+      timedOut = true;
       try { child.kill('SIGKILL'); } catch {}
     }, timeoutMs);
     if (child.stdout) child.stdout.on('data', (d) => { stdout += d.toString(); });
@@ -90,7 +109,7 @@ function runCmd(cmd, args, timeoutMs = 8000) {
     });
     child.on('close', (code) => {
       clearTimeout(timer);
-      resolve({ exitCode: code ?? 0, stdout, stderr });
+      resolve({ exitCode: timedOut ? -1 : code ?? 0, stdout, stderr, timedOut });
     });
   });
 }
@@ -248,7 +267,7 @@ async function resolveSshHostName(sshHost) {
 }
 
 async function pairSyncthingForNode(node, stKey, macDeviceId, logs) {
-  if (!stKey || !macDeviceId || !node.syncthingDeviceId || !node.syncthingFolderId || !node.sshHost) return;
+  if (!stKey || !macDeviceId || !node.syncthingDeviceId || !node.syncthingFolderId || !node.sshHost || node.projectMappings?.length || node.removedProjects?.length) return;
   const remoteId = node.syncthingDeviceId;
   const hostName = await resolveSshHostName(node.sshHost);
   const remoteAddrs = ['dynamic'];
@@ -334,7 +353,7 @@ async function provisionLinuxNode(node) {
   // Register local folder in 本机 Syncthing if API key available
   const stKey = getSyncthingApiKey();
   let macDeviceId = '';
-  if (stKey && node.syncthingFolderId) {
+  if (stKey && node.syncthingFolderId && !node.projectMappings?.length && !node.removedProjects?.length) {
     try {
       const sysRes = await runCmd('curl', ['-s', '--max-time', '2', '-H', `X-API-Key: ${stKey}`, `${SYNCTHING_URL}/rest/system/status`], 2500);
       if (sysRes.stdout) {
@@ -868,7 +887,7 @@ function upsertProjectInSqlite(node, remotePath, name, pinnedVisible = 0) {
   const rel = cleanPath === remoteRoot
     ? ''
     : cleanPath.slice(remoteRoot.length + 1);
-  const localPath = rel ? path.join(node.localWorkDir, rel) : node.localWorkDir;
+  const localPath = mapper([node], node.localWorkDir).toLocal(cleanPath, node.id);
   const displayName = cleanPath === remoteRoot ? `${node.localWorkAlias} (主工作区)` : path.basename(cleanPath);
   const key = `${node.id}::${cleanPath}`;
   stmtUpsertProject.run(key, node.id, cleanPath, localPath, displayName, pinnedVisible ? 1 : 0, Date.now());
@@ -987,6 +1006,7 @@ async function syncAllNodesToSqlite() {
 
 function readTreeFromSqlite() {
   const nodes = loadNodes();
+  for (const node of nodes) for (const project of node.projectMappings || []) upsertProjectInSqlite(node, project.remotePath, project.name, 1);
   const statusRows = workbenchDb.prepare('SELECT node_id, online, last_sync_at FROM node_status').all();
   const statusMap = new Map(statusRows.map((r) => [r.node_id, r]));
 
@@ -1024,6 +1044,7 @@ function readTreeFromSqlite() {
   for (const p of projectRows) {
     const node = nodeMap.get(p.node_id);
     if (!node) continue;
+    if ((node.removedProjects || []).includes(p.path)) continue;
     const remoteRoot = (node.remoteWorkDir || '/root/work').replace(/\/+$/, '') || '/root/work';
     const st = statusMap.get(node.id);
     foldersByKey.set(p.key, {
@@ -1047,6 +1068,7 @@ function readTreeFromSqlite() {
   for (const s of sessionRows) {
     const node = nodeMap.get(s.node_id);
     if (!node) continue;
+    if ((node.removedProjects || []).includes(s.project_path)) continue;
     const remoteRoot = (node.remoteWorkDir || '/root/work').replace(/\/+$/, '') || '/root/work';
     const fKey = `${node.id}::${s.project_path}`;
     if (!foldersByKey.has(fKey)) {
@@ -1130,7 +1152,7 @@ syncAllNodesToSqlite().catch(() => {});
 // ============================================================================
 const activePtyTabs = new Map();
 
-function getOrCreatePtyTab({ tabId, sessionId, title, cwd, resume, mode, nodeId, sshHost }) {
+function getOrCreatePtyTab({ tabId, sessionId, title, cwd, resume, mode, nodeId, sshHost, ephemeral = false }) {
   if (activePtyTabs.has(tabId)) {
     const existing = activePtyTabs.get(tabId);
     if (!existing.exited) {
@@ -1146,10 +1168,13 @@ function getOrCreatePtyTab({ tabId, sessionId, title, cwd, resume, mode, nodeId,
   const targetSshHost = mode === 'local' ? '' : sshHost || node.sshHost || '';
   const sid = sessionId || crypto.randomUUID();
   const isShell = mode === 'shell' || mode === 'local';
-  if (mode !== 'local') registerSessionInSqlite({ id: sid, nodeId: node.id, cwd: targetCwd, title });
+  if (mode !== 'local' && !ephemeral) registerSessionInSqlite({ id: sid, nodeId: node.id, cwd: targetCwd, title });
 
   const launcherScript = path.join(__dirname, 'native-ssh-session.sh');
-  const ptyProc = pty.spawn(platform.isWindows ? process.execPath : '/bin/bash', [platform.isWindows ? path.join(cfg.REPO_ROOT, 'scripts/ssh-session.js') : launcherScript, String(tabId), targetCwd, targetSshHost], {
+  const ptyProc = spawnTerminal(platform.isWindows ? process.execPath : '/bin/bash', [platform.isWindows ? path.join(cfg.REPO_ROOT, 'scripts/ssh-session.js') : launcherScript, String(tabId), targetCwd, targetSshHost, mode || ''], {
+    // Use node-pty's bundled ConPTY to avoid the Windows system ConPTY
+    // teardown race (console-list agent / AttachConsole).
+    ...(platform.isWindows ? { useConpty: true, useConptyDll: true } : {}),
     name: 'xterm-256color',
     cols: 120,
     rows: 36,
@@ -1162,6 +1187,7 @@ function getOrCreatePtyTab({ tabId, sessionId, title, cwd, resume, mode, nodeId,
   });
 
   const tabObj = {
+    ephemeral,
     tabId,
     sessionId: sid,
     title: title || (isShell ? `终端 (${path.basename(targetCwd)})` : `对话 ${sid.slice(0, 8)}`),
@@ -1238,7 +1264,7 @@ function closePtyTab(tabId, explicitNodeId) {
     tab.ptyProc.kill();
   } catch {}
   for (const ws of tab.clients) {
-    try { ws.close(); } catch {}
+    try { ws.send(JSON.stringify({ type: 'exit', tabId, exitCode: 0 })); ws.close(); } catch {}
   }
   tab.clients.clear();
   return true;
@@ -1248,6 +1274,7 @@ function closePtyTab(tabId, explicitNodeId) {
 // 3. Multi-Node Session File Browser & Preview Helpers (Mac Local Path Priority)
 // ============================================================================
 function workspaceMapper() { return mapper(loadNodes(), LOCAL_WORK_DIR, WORKSPACE_LINK_DIR); }
+function isWorkspacePath(p) { return Boolean(p) && (platform.contains(BASE_TAKT_DIR, p) || loadNodes().some(n => (n.projectMappings || []).some(m => platform.contains(m.localPath, p)))); }
 function inferNodeFromPathOrId(inputPath = '', nodeId = '') { return workspaceMapper().nodeFor(inputPath, nodeId); }
 function mapRemoteCwdToLocal(cwd = '/root/work', nodeId = '') { return workspaceMapper().toLocal(cwd, nodeId); }
 function mapAnyCwdToRemote(cwd = '/root/work', nodeId = '') { return workspaceMapper().resolve(cwd, '/root/work', nodeId).remotePath; }
@@ -1255,7 +1282,6 @@ function resolveAnyFilePathToLocalAndRemote(inputPath, cwd = '/root/work', nodeI
 
 async function buildFileTree(localRoot, remoteRoot, node, maxDepth = 4) {
   const IGNORE = new Set(['.git', 'node_modules', '__pycache__', '.DS_Store', '.stfolder', '.stversions', 'dist', 'build', '.next']);
-  const localBase = (node && node.localWorkDir) || LOCAL_WORK_DIR;
   const remoteBase = ((node && node.remoteWorkDir) || '/root/work').replace(/\/+$/, '') || '/root/work';
 
   async function walkLocal(dir, depth) {
@@ -1270,8 +1296,7 @@ async function buildFileTree(localRoot, remoteRoot, node, maxDepth = 4) {
     for (const e of entries) {
       if (IGNORE.has(e.name) || e.name.startsWith('.st')) continue;
       const fullLocal = path.join(dir, e.name);
-      const relFromWork = path.relative(localBase, fullLocal).split(path.sep).join('/');
-      const fullRemote = relFromWork ? `${remoteBase}/${relFromWork}` : remoteBase;
+      const fullRemote = workspaceMapper().resolve(fullLocal, remoteBase, node.id).remotePath;
       const relFromProject = path.relative(localRoot, fullLocal).split(path.sep).join('/');
 
       try {
@@ -1399,9 +1424,8 @@ async function getCombinedSystemStatus() {
   const anyNodeOnline = onlineNodeEntries.length > 0 || Boolean(mcpData?.remoteCli?.online);
   const anyMcpOk = nodeEntries.some((n) => n && n.mcpOk) || Boolean(mcpData?.mcpStatus?.ok);
   const totalCliProcs = nodeEntries.reduce((acc, n) => acc + Number(n?.processCount || 0), 0) || (mcpData?.remoteCli?.processCount ?? activePtyTabs.size);
-  const bestPing = onlineNodeEntries.length > 0
-    ? Math.min(...onlineNodeEntries.map((n) => Number(n.pingMs || 999)))
-    : (mcpData?.mcpStatus?.pingMs || null);
+  const measuredTimes = onlineNodeEntries.map((n) => n.pingMs).filter((ms) => Number.isFinite(ms) && ms >= 0);
+  const bestPing = measuredTimes.length ? Math.min(...measuredTimes) : (mcpData?.mcpStatus?.pingMs ?? null);
   const activeHostSummary = onlineNodeEntries.length > 0
     ? onlineNodeEntries.map((n) => n.sshHost).join('+')
     : '';
@@ -1534,7 +1558,7 @@ const server = http.createServer(async (req, res) => {
         syncAllNodesToSqlite().catch(() => {});
       }
       const tree = readTreeFromSqlite();
-      const openTabs = Array.from(activePtyTabs.values()).map((t) => ({
+      const openTabs = Array.from(activePtyTabs.values()).filter(t => !t.ephemeral).map((t) => ({
         tabId: t.tabId,
         sessionId: t.sessionId,
         title: t.title,
@@ -1622,6 +1646,7 @@ const server = http.createServer(async (req, res) => {
       const enabled = body.enabled !== undefined ? Boolean(body.enabled) : Boolean(sshHost);
 
       let target = nodes.find((n) => n.id === id);
+      if (target?.projectMappings?.length && (target.sshHost !== sshHost || target.remoteWorkDir !== remoteWorkDir || target.localWorkDir !== localWorkDir)) throw Error('该节点已有项目同步，请保留现有服务器及工作区路径');
       if (target) {
         target.name = name;
         target.badge = badge;
@@ -1669,6 +1694,74 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === 'POST' && u.pathname === '/api/project-sync/pick') {
+      if (directoryPickerBusy) { sendJson(res, 409, { ok: false, error: '目录选择窗口已打开，请先完成或取消选择' }); return; }
+      directoryPickerBusy = true;
+      try { sendJson(res, 200, { ok: true, path: await pickDesktopDirectory() }); }
+      finally { directoryPickerBusy = false; }
+      return;
+    }
+    if (req.method === 'GET' && u.pathname === '/api/project-sync/status') {
+      const key = getSyncthingApiKey();
+      const projects = [];
+      let folderConfigs = [], connections = {};
+      try {
+        const options = { headers: { 'X-API-Key': key || '' }, signal: AbortSignal.timeout(3000) };
+        const [folders, peers] = await Promise.all([fetch(`${SYNCTHING_URL}/rest/config/folders`, options), fetch(`${SYNCTHING_URL}/rest/system/connections`, options)]);
+        if (!folders.ok || !peers.ok) throw Error('Syncthing unavailable');
+        folderConfigs = await folders.json(); connections = (await peers.json()).connections || {};
+      } catch { /* Individual probes below report unavailable when the API fails. */ }
+      for (const node of loadNodes()) for (const project of node.projectMappings || []) {
+        try {
+          const r = await fetch(`${SYNCTHING_URL}/rest/db/status?folder=${encodeURIComponent(project.id)}`, { headers: { 'X-API-Key': key || '' }, signal: AbortSignal.timeout(3000) });
+          if (!r.ok) throw Error('Syncthing HTTP ' + r.status);
+          const s = await r.json();
+          const paused = folderConfigs.find(f => f.id === project.id)?.paused;
+          const connected = Boolean(connections[node.syncthingDeviceId]?.connected);
+          projects.push({ ...project, state: paused ? 'paused' : !connected ? 'disconnected' : s.state, needFiles: s.needFiles, needBytes: s.needBytes, errors: s.errors });
+        } catch (e) { projects.push({ ...project, state: 'unavailable', error: e.message }); }
+      }
+      sendJson(res, 200, { ok: true, projects }); return;
+    }
+    if (req.method === 'POST' && u.pathname === '/api/project-sync') {
+      if (projectSyncBusy) { sendJson(res, 409, { ok: false, error: '已有项目正在配置，请稍后重试' }); return; }
+      projectSyncBusy = true;
+      try {
+      const body = await readJsonBody(req);
+      const nodes = loadNodes();
+      const node = nodes.find(n => n.id === body.nodeId);
+      if (!node) throw Error('节点不存在');
+      if (body.acceptPause !== true) throw Error('请确认暂停原整目录同步');
+      const mapping = await configureProject({ node, localPath: String(body.localPath || ''), name: String(body.name || '').trim(), run: runCmd, cfg });
+      node.projectMappings = [...(node.projectMappings || []), mapping];
+      saveNodes(nodes);
+      upsertProjectInSqlite(node, mapping.remotePath, mapping.name, 1);
+      sendJson(res, 200, { ok: true, mapping });
+      } finally { projectSyncBusy = false; }
+      return;
+    }
+    if (req.method === 'DELETE' && u.pathname === '/api/project-sync') {
+      if (projectSyncBusy) { sendJson(res, 409, { ok: false, error: '同步配置正在修改，请稍后重试' }); return; }
+      projectSyncBusy = true;
+      try {
+        const body = await readJsonBody(req);
+        const nodes = loadNodes();
+        const node = nodes.find(n => n.id === body.nodeId);
+        const mapping = node?.projectMappings?.find(m => m.remotePath === body.remotePath);
+        if (!mapping && node?.removedProjects?.includes(body.remotePath)) { sendJson(res, 200, { ok: true, alreadyRemoved: true }); return; }
+        if (!mapping || mapping.remotePath === node.remoteWorkDir) throw Error('仅支持移除独立同步项目，不能移除 work 根目录');
+        if ([...activePtyTabs.values()].some(t => t.nodeId === node.id && (t.cwd === mapping.remotePath || t.cwd.startsWith(mapping.remotePath + '/')))) throw Error('该项目仍有打开的终端，请先关闭这些终端再移除项目');
+        const result = await removeProject({ node, mapping, run: runCmd, cfg, commit: async () => {
+          node.projectMappings = node.projectMappings.filter(m => m.id !== mapping.id);
+          node.removedProjects = [...new Set([...(node.removedProjects || []), mapping.remotePath])];
+          const temporary = NODES_FILE + '.' + crypto.randomUUID() + '.tmp';
+          fs.writeFileSync(temporary, JSON.stringify({ nodes }, null, 2));
+          fs.renameSync(temporary, NODES_FILE);
+        } });
+        sendJson(res, 200, { ok: true, ...result, localPath: mapping.localPath, remotePath: mapping.remotePath });
+      } finally { projectSyncBusy = false; }
+      return;
+    }
     // API: Create a new project folder on the specified Linux node & its paired Mac local workN folder
     if (req.method === 'POST' && u.pathname === '/api/projects') {
       const body = await readJsonBody(req);
@@ -2013,7 +2106,7 @@ const server = http.createServer(async (req, res) => {
       const nodeId = String(body.nodeId || '').trim();
       const srcInfo = resolveAnyFilePathToLocalAndRemote(body.sourcePath || '', cwd, nodeId);
       const dstDirInfo = resolveAnyFilePathToLocalAndRemote(body.targetDirPath || cwd, cwd, nodeId);
-      if (!srcInfo.localPath || !dstDirInfo.localPath || !platform.contains(BASE_TAKT_DIR, srcInfo.localPath) || !platform.contains(BASE_TAKT_DIR, dstDirInfo.localPath)) {
+      if (!isWorkspacePath(srcInfo.localPath) || !isWorkspacePath(dstDirInfo.localPath)) {
         sendJson(res, 400, { ok: false, error: '非法路径：仅允许在本地工作区内拖拽移动' });
         return;
       }
@@ -2041,7 +2134,7 @@ const server = http.createServer(async (req, res) => {
       const dstDirInfo = resolveAnyFilePathToLocalAndRemote(body.targetDirPath || cwd, cwd, nodeId);
       const fileName = path.basename(String(body.fileName || '').trim());
       const contentBase64 = String(body.contentBase64 || '');
-      if (!fileName || !dstDirInfo.localPath || !platform.contains(BASE_TAKT_DIR, dstDirInfo.localPath)) {
+      if (!fileName || !isWorkspacePath(dstDirInfo.localPath)) {
         sendJson(res, 400, { ok: false, error: '无效的文件名或目标目录' });
         return;
       }
@@ -2060,7 +2153,7 @@ const server = http.createServer(async (req, res) => {
       const nodeId = String(body.nodeId || '').trim();
       const parentInfo = resolveAnyFilePathToLocalAndRemote(body.parentDirPath || cwd, cwd, nodeId);
       const folderName = path.basename(String(body.name || '').trim());
-      if (!folderName || !parentInfo.localPath || !platform.contains(BASE_TAKT_DIR, parentInfo.localPath)) {
+      if (!folderName || !isWorkspacePath(parentInfo.localPath)) {
         sendJson(res, 400, { ok: false, error: '目录名不能为空' });
         return;
       }
@@ -2151,7 +2244,8 @@ wss.on('connection', (ws, _req, u) => {
   const cols = Number(u.searchParams.get('cols') || 120);
   const rows = Number(u.searchParams.get('rows') || 36);
 
-  const tab = getOrCreatePtyTab({ tabId, sessionId, title, cwd, resume, mode, nodeId, sshHost });
+  const ephemeral = u.searchParams.get('ephemeral') === '1';
+  const tab = getOrCreatePtyTab({ tabId, sessionId, title, cwd, resume, mode, nodeId, sshHost, ephemeral });
   tab.clients.add(ws);
 
   try {

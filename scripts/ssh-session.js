@@ -5,15 +5,22 @@ const readline = require('node:readline');
 const platform = require('../lib/platform');
 const { interactiveArgs } = require('../lib/ssh');
 
-const [tabId = 'default', cwd = '/root/work', host = ''] = process.argv.slice(2);
+const [tabId = 'default', cwd = '/root/work', host = '', mode = ''] = process.argv.slice(2);
 let child;
 let stopped = false;
 process.on('SIGTERM', () => { stopped = true; if (child) child.kill(); process.exit(); });
 process.on('SIGINT', () => {}); // Ctrl-C belongs to the interactive SSH session.
 async function run() {
   if (!host) {
-    console.log('[TAKT] 尚未绑定 SSH 主机。当前为本机终端，请在“节点”中配置服务器。');
-    child = spawn(platform.isWindows ? platform.powershell : '/bin/bash', platform.isWindows ? ['-NoLogo', '-NoProfile'] : ['-l'], { stdio: 'inherit', env: platform.childEnv() });
+    console.log(mode === 'local' ? '[TAKT] 本机终端 · ' + (platform.isWindows ? 'PowerShell' : 'Bash') : '[TAKT] 尚未绑定 SSH 主机。当前为本机终端，请在“节点”中配置服务器。');
+    const env = platform.childEnv();
+    // Codex injects its own PowerShell modules into the parent environment. Its
+    // PSReadLine can trigger a publisher prompt in Windows PowerShell 5.1.
+    // Keep the user's normal module paths and execution policy intact.
+    if (platform.isWindows && env.PSModulePath) {
+      env.PSModulePath = env.PSModulePath.split(';').filter((entry) => !/[\\/]codex-runtimes[\\/]codex-primary-runtime[\\/]dependencies[\\/]native[\\/]powershell[\\/]modules[\\/]?$/i.test(entry)).join(';');
+    }
+    child = spawn(platform.isWindows ? platform.powershell : '/bin/bash', platform.isWindows ? ['-NoLogo', '-NoProfile'] : ['-l'], { stdio: 'inherit', env });
     return new Promise((resolve) => { child.on('error', (err) => { console.error(err.message); resolve(); }); child.on('exit', resolve); });
   }
   let failures = 0;

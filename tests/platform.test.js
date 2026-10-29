@@ -23,6 +23,14 @@ test('Windows mirror mapping accepts drive letters, Chinese, slashes and line re
   assert.equal(m.resolve('file.txt', '/root/work/工程', 'two').localPath, 'D:\\TAKT 工作区\\work2\\工程\\file.txt');
   assert.equal(m.resolve('D:\\TAKT 工作区\\work2\\file.txt', '', 'one').node.id, 'two');
 });
+test('project mappings resolve original local folders and remote project paths', () => {
+  const mapped = [{ ...nodes[1], projectMappings: [{ localPath: 'E:\\项目\\控制器', remotePath: '/root/work/controller' }] }];
+  const m = mapper(mapped, mapped[0].localWorkDir, '', path.win32);
+  assert.equal(m.resolve('/root/work/controller/src/main.c:12', '', 'two').localPath, 'E:\\项目\\控制器\\src\\main.c');
+  assert.equal(m.resolve('E:\\项目\\控制器\\src\\main.c', '', 'two').remotePath, '/root/work/controller/src/main.c');
+  assert.equal(m.resolve('main.c', '/root/work/controller/src', 'two').remotePath, '/root/work/controller/src/main.c');
+  assert.equal(m.resolve('/root/work/controller-other/a.c', '', 'two').localPath, 'D:\\TAKT 工作区\\work2\\controller-other\\a.c');
+});
 test('Windows containment rejects siblings, parent traversal and other drives', () => {
   const root = nodes[0].localWorkDir;
   assert(contains(root, root.toUpperCase() + '\\子目录', path.win32));
